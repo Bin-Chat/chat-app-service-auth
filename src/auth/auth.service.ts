@@ -1,14 +1,27 @@
-﻿import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  ConflictException,
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as bcrypt from 'bcrypt';
-import { User } from '../user/entities/user.entity';
+import { User, UserRole } from '../user/entities/user.entity';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+import { VerifyRegistrationDto } from './dto/verify-registration.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
+import { KafkaProducerService } from '../kafka/kafka-producer.service';
+import { USER_EVENTS } from '../kafka/events/user.events';
+import { NOTIFICATION_EVENTS } from '../kafka/events/notification.events';
 import { randomBytes } from 'crypto';
 
 @Injectable()
@@ -17,31 +30,162 @@ export class AuthService {
     @InjectRepository(User) private userRepo: Repository<User>,
     private jwtService: JwtService,
     private configService: ConfigService,
-    private redisService: RedisService
+    private redisService: RedisService,
+    private kafkaProducer: KafkaProducerService
   ) {}
 
-  async register(dto: RegisterDto, deviceId?: string): Promise<AuthResponseDto> {
-    const existing = await this.userRepo.findOne({ where: { phoneNumber: dto.phoneNumber } });
-    if (existing) throw new ConflictException('Số điện thoại đã được đăng ký');
+  async register(dto: RegisterDto): Promise<{ message: string }> {
+    const existing = await this.userRepo.findOne({ where: { email: dto.email } });
+
+    if (existing && existing.isEmailVerified) {
+      throw new ConflictException('Email đã được đăng ký');
+    }
 
     const passwordHash = await bcrypt.hash(dto.password, 10);
-    const user = this.userRepo.create({ ...dto, passwordHash });
+
+    if (existing && !existing.isEmailVerified) {
+      // Cho phép đăng ký lại với OTP mới khi chưa xác thực
+      existing.passwordHash = passwordHash;
+      existing.fullName = dto.fullName;
+      await this.userRepo.save(existing);
+    } else {
+      const user = this.userRepo.create({
+        email: dto.email,
+        passwordHash,
+        fullName: dto.fullName,
+        isEmailVerified: false,
+      });
+      await this.userRepo.save(user);
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await this.redisService.savePendingOtp(dto.email, otp, 900);
+
+    await this.kafkaProducer.emit(NOTIFICATION_EVENTS.SEND_EMAIL, {
+      to: dto.email,
+      type: 'email_verification',
+      data: { fullName: dto.fullName || 'bạn', otp },
+    });
+
+    return { message: 'Mã xác thực đã được gửi đến email của bạn' };
+  }
+
+  async verifyRegistration(
+    dto: VerifyRegistrationDto,
+    deviceId?: string
+  ): Promise<AuthResponseDto> {
+    const user = await this.userRepo.findOne({ where: { email: dto.email } });
+    if (!user) {
+      throw new BadRequestException(
+        'Phiên đăng ký đã hết hạn hoặc không tồn tại. Vui lòng đăng ký lại.'
+      );
+    }
+    if (user.isEmailVerified) {
+      throw new BadRequestException('Email này đã được xác thực. Vui lòng đăng nhập.');
+    }
+
+    const storedOtp = await this.redisService.getPendingOtp(dto.email);
+    if (!storedOtp) {
+      throw new BadRequestException('Mã OTP đã hết hạn, vui lòng yêu cầu gửi lại');
+    }
+    if (storedOtp !== dto.otp) {
+      throw new BadRequestException('Mã OTP không đúng');
+    }
+
+    user.isEmailVerified = true;
     await this.userRepo.save(user);
 
-    // Generate deviceId if not provided
+    await this.redisService.deletePendingOtp(dto.email);
+
+    await this.kafkaProducer.emit(USER_EVENTS.REGISTERED, {
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+      createdAt: user.createdAt,
+    });
+
+    await this.kafkaProducer.emit(NOTIFICATION_EVENTS.SEND_EMAIL, {
+      to: user.email,
+      type: 'welcome',
+      data: { fullName: user.fullName || 'bạn' },
+    });
+
     const finalDeviceId = deviceId || this.generateDeviceId();
     return this.generateTokens(user, finalDeviceId);
   }
 
-  async login(dto: LoginDto, deviceId?: string): Promise<AuthResponseDto> {
-    const user = await this.userRepo.findOne({ where: { phoneNumber: dto.phoneNumber } });
-    if (!user || !(await bcrypt.compare(dto.password, user.passwordHash))) {
-      throw new UnauthorizedException('Số điện thoại hoặc mật khẩu không đúng');
+  async resendVerification(email: string): Promise<{ message: string }> {
+    const user = await this.userRepo.findOne({ where: { email } });
+    if (!user || user.isEmailVerified) {
+      throw new BadRequestException('Không tìm thấy phiên đăng ký. Vui lòng đăng ký lại.');
     }
 
-    // Generate deviceId if not provided
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await this.redisService.savePendingOtp(email, otp, 900);
+
+    await this.kafkaProducer.emit(NOTIFICATION_EVENTS.SEND_EMAIL, {
+      to: email,
+      type: 'email_verification',
+      data: { fullName: user.fullName || 'bạn', otp },
+    });
+
+    return { message: 'Mã xác thực mới đã được gửi đến email của bạn' };
+  }
+
+  async login(dto: LoginDto, deviceId?: string): Promise<AuthResponseDto> {
+    const user = await this.userRepo.findOne({ where: { email: dto.email } });
+    if (!user || !(await bcrypt.compare(dto.password, user.passwordHash))) {
+      throw new UnauthorizedException('Email hoặc mật khẩu không đúng');
+    }
+    if (!user.isEmailVerified) {
+      throw new UnauthorizedException('Vui lòng xác thực email trước khi đăng nhập');
+    }
+    if (!user.isActive) {
+      throw new UnauthorizedException('Tài khoản đã bị khóa. Vui lòng liên hệ quản trị viên.');
+    }
+
     const finalDeviceId = deviceId || this.generateDeviceId();
     return this.generateTokens(user, finalDeviceId);
+  }
+
+  async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
+    const user = await this.userRepo.findOne({ where: { email: dto.email } });
+
+    if (!user) {
+      throw new BadRequestException('Email không tồn tại trong hệ thống');
+    }
+    if (!user.isEmailVerified) {
+      throw new BadRequestException('Email chưa được xác thực');
+    }
+    if (!user.isActive) {
+      throw new BadRequestException('Tài khoản đã bị khóa');
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await this.redisService.saveOtp(user.id, otp, 900);
+
+    await this.kafkaProducer.emit(NOTIFICATION_EVENTS.SEND_EMAIL, {
+      to: user.email,
+      type: 'password_reset',
+      data: { fullName: user.fullName || 'bạn', otp },
+    });
+
+    return { message: 'Mã OTP đã được gửi đến email của bạn' };
+  }
+
+  async resetPassword(dto: ResetPasswordDto): Promise<{ message: string }> {
+    const user = await this.userRepo.findOne({ where: { email: dto.email } });
+    if (!user) throw new BadRequestException('Email không tồn tại');
+
+    const storedOtp = await this.redisService.getOtp(user.id);
+    if (!storedOtp) throw new BadRequestException('Mã OTP đã hết hạn, vui lòng yêu cầu lại');
+    if (storedOtp !== dto.otp) throw new BadRequestException('Mã OTP không đúng');
+
+    user.passwordHash = await bcrypt.hash(dto.newPassword, 10);
+    await this.userRepo.save(user);
+    await this.redisService.deleteOtp(user.id);
+
+    return { message: 'Đặt lại mật khẩu thành công' };
   }
 
   async refreshToken(
@@ -50,23 +194,18 @@ export class AuthService {
     refreshToken: string
   ): Promise<AuthResponseDto> {
     try {
-      // 1. Verify JWT signature
       const payload = this.jwtService.verify(refreshToken, {
         secret: this.configService.get('JWT_REFRESH_SECRET'),
       });
 
-      // 2. Check if token exists in Redis
       const isValid = await this.redisService.verifyRefreshToken(userId, deviceId, refreshToken);
-
       if (!isValid) {
         throw new UnauthorizedException('Refresh token đã hết hạn hoặc đã bị thu hồi');
       }
 
-      // 3. Get user
       const user = await this.userRepo.findOne({ where: { id: payload.sub } });
       if (!user) throw new UnauthorizedException('User không tồn tại');
 
-      // 4. Generate new tokens with same deviceId
       return this.generateTokens(user, deviceId);
     } catch (error) {
       throw new UnauthorizedException('Refresh token không hợp lệ');
@@ -81,8 +220,40 @@ export class AuthService {
     await this.redisService.deleteAllRefreshTokens(userId);
   }
 
+  // ─── Admin Methods ────────────────────────────────────────────────────────────
+
+  async getAllUsers(): Promise<Partial<User>[]> {
+    return this.userRepo.find({
+      select: ['id', 'email', 'fullName', 'avatar', 'isActive', 'role', 'createdAt'],
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  async updateUserStatus(id: string, isActive: boolean): Promise<{ message: string }> {
+    const user = await this.userRepo.findOne({ where: { id } });
+    if (!user) throw new NotFoundException('Người dùng không tồn tại');
+    user.isActive = isActive;
+    await this.userRepo.save(user);
+    return { message: isActive ? 'Đã mở khóa tài khoản' : 'Đã khóa tài khoản' };
+  }
+
+  async updateUserRole(
+    id: string,
+    role: UserRole,
+    requesterId: string
+  ): Promise<{ message: string }> {
+    if (id === requesterId) {
+      throw new ForbiddenException('Không thể tự thay đổi role của mình');
+    }
+    const user = await this.userRepo.findOne({ where: { id } });
+    if (!user) throw new NotFoundException('Người dùng không tồn tại');
+    user.role = role;
+    await this.userRepo.save(user);
+    return { message: `Đã cập nhật role thành ${role}` };
+  }
+
   private async generateTokens(user: User, deviceId: string): Promise<AuthResponseDto> {
-    const payload = { sub: user.id, phone: user.phoneNumber, deviceId };
+    const payload = { sub: user.id, email: user.email, deviceId, role: user.role };
 
     const accessToken = this.jwtService.sign(payload, {
       secret: this.configService.get('JWT_SECRET'),
@@ -94,18 +265,12 @@ export class AuthService {
       expiresIn: this.configService.get('JWT_REFRESH_EXPIRATION'),
     });
 
-    // Save refresh token to Redis (7 days TTL)
-    await this.redisService.saveRefreshToken(
-      user.id,
-      deviceId,
-      refreshToken,
-      7 * 24 * 60 * 60 // 7 days in seconds
-    );
+    await this.redisService.saveRefreshToken(user.id, deviceId, refreshToken, 7 * 24 * 60 * 60);
 
     return {
       accessToken,
       refreshToken,
-      user: { id: user.id, phoneNumber: user.phoneNumber, fullName: user.fullName },
+      user: { id: user.id, email: user.email, fullName: user.fullName, role: user.role },
       deviceId,
     };
   }

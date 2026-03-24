@@ -105,4 +105,31 @@ export class RedisService implements OnModuleDestroy {
     const keys = await this.client.keys(pattern);
     return keys.length;
   }
+
+  async saveOtp(userId: string, otp: string, ttl: number = 900): Promise<void> {
+    const key = `otp:${userId}`;
+    await this.client.setex(key, ttl, otp);
+  }
+
+  async getOtp(userId: string): Promise<string | null> {
+    const key = `otp:${userId}`;
+    return await this.client.get(key);
+  }
+
+  async deleteOtp(userId: string): Promise<void> {
+    const key = `otp:${userId}`;
+    await this.client.del(key);
+  }
+
+  async savePendingOtp(email: string, otp: string, ttl: number = 900): Promise<void> {
+    await this.client.setex(`otp:pending:${email}`, ttl, otp);
+  }
+
+  async getPendingOtp(email: string): Promise<string | null> {
+    return await this.client.get(`otp:pending:${email}`);
+  }
+
+  async deletePendingOtp(email: string): Promise<void> {
+    await this.client.del(`otp:pending:${email}`);
+  }
 }

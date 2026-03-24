@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from './auth/auth.module';
 import { UserModule } from './user/user.module';
 import { RedisModule } from './redis/redis.module';
+import { KafkaProducerModule } from './kafka/kafka-producer.module';
 import { User } from './user/entities/user.entity';
 
 @Module({
@@ -23,6 +24,7 @@ import { User } from './user/entities/user.entity';
       }),
     }),
     RedisModule,
+    KafkaProducerModule,
     AuthModule,
     UserModule,
   ],

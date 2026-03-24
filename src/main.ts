@@ -1,5 +1,5 @@
-﻿import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+﻿import { NestFactory, Reflector } from '@nestjs/core';
+import { ValidationPipe, ClassSerializerInterceptor } from '@nestjs/common';
 import { AppModule } from './app.module';
 import cookieParser from 'cookie-parser';
 
@@ -19,7 +19,8 @@ async function bootstrap() {
   app.use(cookieParser());
 
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
-  // No global prefix - Gateway handles /api/auth routing
+  app.useGlobalInterceptors(new ClassSerializerInterceptor(app.get(Reflector)));
+  app.setGlobalPrefix('api');
 
   const port = process.env.PORT || 3010;
   await app.listen(port);

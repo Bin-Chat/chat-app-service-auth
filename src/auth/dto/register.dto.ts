@@ -1,10 +1,9 @@
-﻿import { IsString, IsNotEmpty, MinLength, Matches } from 'class-validator';
+﻿import { IsString, IsNotEmpty, MinLength, IsEmail } from 'class-validator';
 
 export class RegisterDto {
-  @IsString({ message: 'Số điện thoại phải là chuỗi ký tự' })
-  @IsNotEmpty({ message: 'Số điện thoại không được để trống' })
-  @Matches(/^[0-9]{10,11}$/, { message: 'Số điện thoại phải có 10-11 chữ số' })
-  phoneNumber: string;
+  @IsEmail({}, { message: 'Email không hợp lệ' })
+  @IsNotEmpty({ message: 'Email không được để trống' })
+  email: string;
 
   @IsString({ message: 'Mật khẩu phải là chuỗi ký tự' })
   @IsNotEmpty({ message: 'Mật khẩu không được để trống' })

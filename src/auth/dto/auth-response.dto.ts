@@ -1,10 +1,13 @@
-﻿export class AuthResponseDto {
+import { UserRole } from '../../user/entities/user.entity';
+
+export class AuthResponseDto {
   accessToken: string;
   refreshToken: string;
   user: {
     id: string;
-    phoneNumber: string;
+    email: string;
     fullName: string;
+    role: UserRole;
   };
   deviceId: string;
 }
