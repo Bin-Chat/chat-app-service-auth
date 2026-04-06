@@ -5,11 +5,12 @@ import {
   BadRequestException,
   ForbiddenException,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import * as bcrypt from 'bcrypt';
+import * as bcrypt from 'bcryptjs';
 import { User, UserRole } from '../user/entities/user.entity';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
@@ -24,8 +25,17 @@ import { USER_EVENTS } from '../kafka/events/user.events';
 import { NOTIFICATION_EVENTS } from '../kafka/events/notification.events';
 import { randomBytes } from 'crypto';
 
+interface UserServiceProfile {
+  fullName?: string | null;
+  avatar?: string | null;
+  phone?: string | null;
+  bio?: string | null;
+}
+
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     @InjectRepository(User) private userRepo: Repository<User>,
     private jwtService: JwtService,
@@ -101,6 +111,7 @@ export class AuthService {
       id: user.id,
       email: user.email,
       fullName: user.fullName,
+      role: user.role,
       createdAt: user.createdAt,
     });
 
@@ -224,7 +235,7 @@ export class AuthService {
 
   async getAllUsers(): Promise<Partial<User>[]> {
     return this.userRepo.find({
-      select: ['id', 'email', 'fullName', 'avatar', 'isActive', 'role', 'createdAt'],
+      select: ['id', 'email', 'fullName', 'isActive', 'role', 'createdAt'],
       order: { createdAt: 'DESC' },
     });
   }
@@ -250,6 +261,125 @@ export class AuthService {
     user.role = role;
     await this.userRepo.save(user);
     return { message: `Đã cập nhật role thành ${role}` };
+  }
+
+  async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string
+  ): Promise<{ message: string }> {
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user) throw new NotFoundException('Người dùng không tồn tại');
+
+    const isMatch = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!isMatch) throw new BadRequestException('Mật khẩu hiện tại không đúng');
+
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    await this.userRepo.save(user);
+
+    return { message: 'Đổi mật khẩu thành công' };
+  }
+
+  async getProfile(
+    userId: string,
+    authorizationHeader?: string,
+    cookieHeader?: string
+  ): Promise<Record<string, unknown>> {
+    if (!userId) {
+      throw new UnauthorizedException('Phiên đăng nhập không hợp lệ');
+    }
+
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user || !user.isActive) {
+      throw new UnauthorizedException('Người dùng không tồn tại hoặc đã bị khóa');
+    }
+
+    const baseProfile = {
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+      role: user.role,
+      isActive: user.isActive,
+      isEmailVerified: user.isEmailVerified,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      avatar: null,
+      phone: null,
+      bio: null,
+    };
+
+    const extendedProfile = await this.fetchUserServiceProfile(
+      user.id,
+      authorizationHeader,
+      cookieHeader
+    );
+
+    if (!extendedProfile) {
+      return baseProfile;
+    }
+
+    return {
+      ...baseProfile,
+      fullName: extendedProfile.fullName ?? baseProfile.fullName,
+      avatar: extendedProfile.avatar ?? null,
+      phone: extendedProfile.phone ?? null,
+      bio: extendedProfile.bio ?? null,
+    };
+  }
+
+  private async fetchUserServiceProfile(
+    userId: string,
+    authorizationHeader?: string,
+    cookieHeader?: string
+  ): Promise<UserServiceProfile | null> {
+    const baseUrls = this.getUserServiceBaseUrls();
+
+    for (const baseUrl of baseUrls) {
+      const abortController = new AbortController();
+      const timeout = setTimeout(() => abortController.abort(), 2500);
+
+      try {
+        const headers: Record<string, string> = { Accept: 'application/json' };
+        if (authorizationHeader) headers.Authorization = authorizationHeader;
+        if (cookieHeader) headers.Cookie = cookieHeader;
+
+        const response = await fetch(`${baseUrl}/api/users/${userId}`, {
+          method: 'GET',
+          headers,
+          signal: abortController.signal,
+        });
+
+        if (response.ok) {
+          return (await response.json()) as UserServiceProfile;
+        }
+
+        this.logger.warn(
+          `Không thể lấy profile mở rộng từ user-service (${baseUrl}), status=${response.status}`
+        );
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.logger.warn(
+          `Gọi user-service thất bại (${baseUrl}) khi lấy profile user ${userId}: ${errorMessage}`
+        );
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    return null;
+  }
+
+  private getUserServiceBaseUrls(): string[] {
+    const configuredUrl = this.configService.get<string>('USER_SERVICE_URL');
+    const candidates = [configuredUrl, 'http://user-service:3020', 'http://localhost:3020'];
+
+    return [
+      ...new Set(
+        candidates
+          .filter((url): url is string => Boolean(url))
+          .map((url) => url.replace(/\/+$/, ''))
+      ),
+    ];
   }
 
   private async generateTokens(user: User, deviceId: string): Promise<AuthResponseDto> {

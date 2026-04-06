@@ -7,6 +7,7 @@ export interface UserRegisteredEvent {
   id: string;
   email: string;
   fullName: string | null;
+  role: string;
   createdAt: Date;
 }
 

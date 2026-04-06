@@ -1,14 +1,4 @@
-import {
-  Controller,
-  Post,
-  Body,
-  UseGuards,
-  Request,
-  Get,
-  Patch,
-  Param,
-  Res,
-} from '@nestjs/common';
+import { Controller, Post, Body, UseGuards, Request, Get, Patch, Param, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
@@ -16,6 +6,7 @@ import { LoginDto } from './dto/login.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyRegistrationDto } from './dto/verify-registration.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
 import { RolesGuard } from './guards/roles.guard';
@@ -115,8 +106,18 @@ export class AuthController {
 
   @Get('profile')
   @UseGuards(JwtAuthGuard)
-  getProfile(@Request() req) {
-    return req.user;
+  async getProfile(@Request() req) {
+    return this.authService.getProfile(
+      req.user?.id ?? req.user?.sub,
+      req.headers.authorization,
+      req.headers.cookie
+    );
+  }
+
+  @Patch('change-password')
+  @UseGuards(JwtAuthGuard)
+  changePassword(@Request() req, @Body() dto: ChangePasswordDto) {
+    return this.authService.changePassword(req.user.id, dto.currentPassword, dto.newPassword);
   }
 
   // ─── Admin Endpoints ──────────────────────────────────────────────────────────
@@ -131,21 +132,14 @@ export class AuthController {
   @Patch('admin/users/:id/status')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  updateUserStatus(
-    @Param('id') id: string,
-    @Body('isActive') isActive: boolean
-  ) {
+  updateUserStatus(@Param('id') id: string, @Body('isActive') isActive: boolean) {
     return this.authService.updateUserStatus(id, isActive);
   }
 
   @Patch('admin/users/:id/role')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  updateUserRole(
-    @Param('id') id: string,
-    @Body('role') role: UserRole,
-    @Request() req
-  ) {
+  updateUserRole(@Param('id') id: string, @Body('role') role: UserRole, @Request() req) {
     return this.authService.updateUserRole(id, role, req.user.id);
   }
 
