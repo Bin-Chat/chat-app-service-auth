@@ -1,4 +1,15 @@
-import { Controller, Post, Body, UseGuards, Request, Get, Patch, Param, Res } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Body,
+  UseGuards,
+  Request,
+  Get,
+  Patch,
+  Param,
+  Delete,
+  Res,
+} from '@nestjs/common';
 import { Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
@@ -118,6 +129,20 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   changePassword(@Request() req, @Body() dto: ChangePasswordDto) {
     return this.authService.changePassword(req.user.id, dto.currentPassword, dto.newPassword);
+  }
+
+  // ─── Device Management ────────────────────────────────────────────────────────
+
+  @Get('devices')
+  @UseGuards(JwtAuthGuard)
+  getDevices(@Request() req) {
+    return this.authService.getDevices(req.user.id, req.cookies.deviceId);
+  }
+
+  @Delete('devices/:deviceId')
+  @UseGuards(JwtAuthGuard)
+  remoteLogout(@Request() req, @Param('deviceId') targetDeviceId: string) {
+    return this.authService.remoteLogout(req.user.id, targetDeviceId);
   }
 
   // ─── Admin Endpoints ──────────────────────────────────────────────────────────

@@ -121,6 +121,74 @@ export class RedisService implements OnModuleDestroy {
     await this.client.del(key);
   }
 
+  // ── Per-type Single-Session helpers ──────────────────────────────────────
+
+  /**
+   * Lưu active deviceId theo từng loại thiết bị (mobile / web).
+   * Mỗi loại chỉ có 1 thiết bị active, login mới sẽ ghi đè thiết bị cũ cùng loại.
+   */
+  async setActiveDevice(
+    userId: string,
+    deviceId: string,
+    deviceType: 'mobile' | 'web'
+  ): Promise<void> {
+    await this.client.setex(`session:active:${userId}:${deviceType}`, 30 * 24 * 60 * 60, deviceId);
+  }
+
+  async getActiveDevice(userId: string, deviceType: 'mobile' | 'web'): Promise<string | null> {
+    return this.client.get(`session:active:${userId}:${deviceType}`);
+  }
+
+  async clearActiveDevice(userId: string, deviceType: 'mobile' | 'web'): Promise<void> {
+    await this.client.del(`session:active:${userId}:${deviceType}`);
+  }
+
+  async clearAllActiveDevices(userId: string): Promise<void> {
+    await this.client.del(`session:active:${userId}:mobile`, `session:active:${userId}:web`);
+  }
+
+  // ── Device info tracking (for management UI) ──────────────────────────────
+
+  async saveDeviceInfo(
+    userId: string,
+    deviceId: string,
+    info: { deviceType: 'mobile' | 'web'; deviceName?: string; loginAt: string },
+    ttl: number = 30 * 24 * 60 * 60
+  ): Promise<void> {
+    await this.client.setex(`session:device:${userId}:${deviceId}`, ttl, JSON.stringify(info));
+  }
+
+  async getDeviceInfo(
+    userId: string,
+    deviceId: string
+  ): Promise<{ deviceType: 'mobile' | 'web'; deviceName?: string; loginAt: string } | null> {
+    const raw = await this.client.get(`session:device:${userId}:${deviceId}`);
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  async clearDeviceInfo(userId: string, deviceId: string): Promise<void> {
+    await this.client.del(`session:device:${userId}:${deviceId}`);
+  }
+
+  async addDeviceToSet(userId: string, deviceId: string): Promise<void> {
+    await this.client.sadd(`session:deviceids:${userId}`, deviceId);
+    await this.client.expire(`session:deviceids:${userId}`, 30 * 24 * 60 * 60);
+  }
+
+  async removeDeviceFromSet(userId: string, deviceId: string): Promise<void> {
+    await this.client.srem(`session:deviceids:${userId}`, deviceId);
+  }
+
+  async getAllDeviceIds(userId: string): Promise<string[]> {
+    return this.client.smembers(`session:deviceids:${userId}`);
+  }
+
+  async clearDeviceSet(userId: string): Promise<void> {
+    await this.client.del(`session:deviceids:${userId}`);
+  }
+
+  // ── OTP helpers ────────────────────────────────────────────────────────────
+
   async savePendingOtp(email: string, otp: string, ttl: number = 900): Promise<void> {
     await this.client.setex(`otp:pending:${email}`, ttl, otp);
   }

@@ -1,4 +1,4 @@
-﻿import { IsNotEmpty, IsEmail } from 'class-validator';
+﻿import { IsNotEmpty, IsEmail, IsOptional, IsIn } from 'class-validator';
 
 export class LoginDto {
   @IsEmail({}, { message: 'Email không hợp lệ' })
@@ -7,4 +7,11 @@ export class LoginDto {
 
   @IsNotEmpty({ message: 'Mật khẩu không được để trống' })
   password: string;
+
+  @IsOptional()
+  @IsIn(['mobile', 'web'], { message: 'deviceType phải là mobile hoặc web' })
+  deviceType?: 'mobile' | 'web';
+
+  @IsOptional()
+  deviceName?: string;
 }

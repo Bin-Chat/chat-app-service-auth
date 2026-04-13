@@ -23,6 +23,7 @@ import { RedisService } from '../redis/redis.service';
 import { KafkaProducerService } from '../kafka/kafka-producer.service';
 import { USER_EVENTS } from '../kafka/events/user.events';
 import { NOTIFICATION_EVENTS } from '../kafka/events/notification.events';
+import { AUTH_EVENTS } from '../kafka/events/auth.events';
 import { randomBytes } from 'crypto';
 
 interface UserServiceProfile {
@@ -122,7 +123,7 @@ export class AuthService {
     });
 
     const finalDeviceId = deviceId || this.generateDeviceId();
-    return this.generateTokens(user, finalDeviceId);
+    return this.generateTokens(user, finalDeviceId, 'web');
   }
 
   async resendVerification(email: string): Promise<{ message: string }> {
@@ -156,7 +157,8 @@ export class AuthService {
     }
 
     const finalDeviceId = deviceId || this.generateDeviceId();
-    return this.generateTokens(user, finalDeviceId);
+    const deviceType = dto.deviceType ?? 'web';
+    return this.generateTokens(user, finalDeviceId, deviceType, dto.deviceName);
   }
 
   async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
@@ -217,18 +219,76 @@ export class AuthService {
       const user = await this.userRepo.findOne({ where: { id: payload.sub } });
       if (!user) throw new UnauthorizedException('User không tồn tại');
 
-      return this.generateTokens(user, deviceId);
+      // Preserve deviceType from existing device info or JWT payload
+      const deviceInfo = await this.redisService.getDeviceInfo(userId, deviceId);
+      const deviceType = deviceInfo?.deviceType ?? payload.deviceType ?? 'web';
+      return this.generateTokens(user, deviceId, deviceType, deviceInfo?.deviceName);
     } catch (error) {
       throw new UnauthorizedException('Refresh token không hợp lệ');
     }
   }
 
   async logout(userId: string, deviceId: string): Promise<void> {
+    const deviceInfo = await this.redisService.getDeviceInfo(userId, deviceId);
     await this.redisService.deleteRefreshToken(userId, deviceId);
+    if (deviceInfo?.deviceType) {
+      await this.redisService.clearActiveDevice(userId, deviceInfo.deviceType);
+    }
+    await this.redisService.removeDeviceFromSet(userId, deviceId);
+    await this.redisService.clearDeviceInfo(userId, deviceId);
   }
 
   async logoutAll(userId: string): Promise<void> {
+    const deviceIds = await this.redisService.getAllDeviceIds(userId);
     await this.redisService.deleteAllRefreshTokens(userId);
+    await this.redisService.clearAllActiveDevices(userId);
+    for (const deviceId of deviceIds) {
+      await this.redisService.clearDeviceInfo(userId, deviceId);
+    }
+    await this.redisService.clearDeviceSet(userId);
+  }
+
+  async getDevices(
+    userId: string,
+    currentDeviceId: string
+  ): Promise<
+    {
+      deviceId: string;
+      deviceType: string;
+      deviceName?: string;
+      loginAt: string;
+      isCurrent: boolean;
+    }[]
+  > {
+    const deviceIds = await this.redisService.getAllDeviceIds(userId);
+    const devices = await Promise.all(
+      deviceIds.map(async (deviceId) => {
+        const info = await this.redisService.getDeviceInfo(userId, deviceId);
+        if (!info) return null;
+        return {
+          deviceId,
+          deviceType: info.deviceType,
+          deviceName: info.deviceName,
+          loginAt: info.loginAt,
+          isCurrent: deviceId === currentDeviceId,
+        };
+      })
+    );
+    return devices.filter(Boolean) as any[];
+  }
+
+  async remoteLogout(userId: string, targetDeviceId: string): Promise<void> {
+    const deviceInfo = await this.redisService.getDeviceInfo(userId, targetDeviceId);
+    await this.redisService.deleteRefreshToken(userId, targetDeviceId);
+    if (deviceInfo?.deviceType) {
+      await this.redisService.clearActiveDevice(userId, deviceInfo.deviceType);
+      await this.kafkaProducer.emit(AUTH_EVENTS.SESSION_KICKED, {
+        userId,
+        deviceType: deviceInfo.deviceType,
+      });
+    }
+    await this.redisService.removeDeviceFromSet(userId, targetDeviceId);
+    await this.redisService.clearDeviceInfo(userId, targetDeviceId);
   }
 
   // ─── Admin Methods ────────────────────────────────────────────────────────────
@@ -382,8 +442,13 @@ export class AuthService {
     ];
   }
 
-  private async generateTokens(user: User, deviceId: string): Promise<AuthResponseDto> {
-    const payload = { sub: user.id, email: user.email, deviceId, role: user.role };
+  private async generateTokens(
+    user: User,
+    deviceId: string,
+    deviceType: 'mobile' | 'web' = 'web',
+    deviceName?: string
+  ): Promise<AuthResponseDto> {
+    const payload = { sub: user.id, email: user.email, name: user.fullName ?? '', deviceId, deviceType, role: user.role };
 
     const accessToken = this.jwtService.sign(payload, {
       secret: this.configService.get('JWT_SECRET'),
@@ -395,7 +460,32 @@ export class AuthService {
       expiresIn: this.configService.get('JWT_REFRESH_EXPIRATION'),
     });
 
-    await this.redisService.saveRefreshToken(user.id, deviceId, refreshToken, 7 * 24 * 60 * 60);
+    const ttl = 7 * 24 * 60 * 60;
+
+    // Per-type single session: kick existing device of same type (nếu khác deviceId)
+    const oldDeviceId = await this.redisService.getActiveDevice(user.id, deviceType);
+    if (oldDeviceId && oldDeviceId !== deviceId) {
+      await this.redisService.deleteRefreshToken(user.id, oldDeviceId);
+      await this.redisService.clearDeviceInfo(user.id, oldDeviceId);
+      await this.redisService.removeDeviceFromSet(user.id, oldDeviceId);
+      // Thông báo cho thiết bị cũ cùng loại đăng xuất ngay
+      await this.kafkaProducer.emit(AUTH_EVENTS.SESSION_KICKED, { userId: user.id, deviceType });
+    }
+
+    // Lưu session mới
+    await this.redisService.saveRefreshToken(user.id, deviceId, refreshToken, ttl);
+    await this.redisService.setActiveDevice(user.id, deviceId, deviceType);
+    await this.redisService.saveDeviceInfo(
+      user.id,
+      deviceId,
+      {
+        deviceType,
+        deviceName: deviceName ?? (deviceType === 'mobile' ? 'Điện thoại' : 'Trình duyệt web'),
+        loginAt: new Date().toISOString(),
+      },
+      ttl
+    );
+    await this.redisService.addDeviceToSet(user.id, deviceId);
 
     return {
       accessToken,
